@@ -1,0 +1,97 @@
+name: Create Release
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build-iso:
+    runs-on: ubuntu-latest
+    # Use an Arch Linux container for the build environment
+    container: archlinux/archlinux:latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Read version from file
+        id: get_version
+        run: |
+          # Read the version from the 'version' file inside axos-iso
+          ISO_VERSION=$(cat axos-iso/version)
+          if [ -z "$ISO_VERSION" ]; then
+            echo "Error: version file is empty or not found at axos-iso/version."
+            exit 1
+          fi
+          echo "Detected ISO version: $ISO_VERSION"
+          # Set the version as a step output
+          echo "version=$ISO_VERSION" >> $GITHUB_OUTPUT
+
+      - name: Install archiso and dependencies
+        run: |
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm archiso mkinitcpio-archiso git find
+
+      - name: Build ISO
+        run: mkarchiso -v -r -w work -o output ISO/axos-iso
+
+      - name: Find built ISO file
+        id: find_iso
+        # Find the generated .iso file in the output directory
+        run: |
+          ISO_FILE=$(find output -name "*.iso" -print -quit)
+          if [ -z "$ISO_FILE" ]; then
+            echo "Error: No ISO file found in the output directory."
+            exit 1
+          fi
+          echo "Detected ISO file: $ISO_FILE"
+          # Set the found path as a step output
+          echo "iso_path=$ISO_FILE" >> $GITHUB_OUTPUT
+
+      - name: Create Git Tag
+        id: create_tag
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const version = core.getInput('version');
+            const tag = `v${version}`;
+            console.log(`Attempting to create tag: ${tag}`);
+            try {
+              await github.rest.git.createRef({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: `refs/tags/${tag}`,
+                sha: context.sha
+              });
+              console.log(`Tag ${tag} created successfully.`);
+              core.setOutput('tag_name', tag);
+            } catch (error) {
+              if (error.status === 422 && error.response.data.message.includes("Reference already exists")) {
+                console.warn(`Tag ${tag} already exists. Skipping tag creation.`);
+                core.setOutput('tag_name', tag); # Still output tag name for release step
+              } else {
+                console.error(`Failed to create tag ${tag}:`, error);
+                throw error;
+              }
+            }
+        env:
+          version: ${{ steps.get_version.outputs.version }}
+        # Allow this step to fail if the tag already exists, the release step can still proceed
+        continue-on-error: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: steps.create_tag.outputs.tag_name # Only run if we determined a tag name
+        with:
+          tag_name: ${{ steps.create_tag.outputs.tag_name }} # Use the created/existing tag name
+          name: Release ${{ steps.get_version.outputs.version }} # Use the version from the file for the release title
+          body: |
+            Automated release triggered by workflow dispatch.
+            ISO built from version file: ${{ steps.get_version.outputs.version }}.
+            Commit SHA: ${{ github.sha }}.
+          files: ${{ steps.find_iso.outputs.iso_path }} # Attach the built ISO file to the release
+          draft: true # Set to true if you want to manually publish the release later
+          prerelease: false # Set to true for pre-releases (e.g., if version contains alpha/beta)
+          # If the tag already exists, this action will update the existing release
+          # if one exists for that tag. Otherwise, it creates a new one.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # GitHub token provided by the action
